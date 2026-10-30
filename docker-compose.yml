@@ -1,0 +1,202 @@
+# Контур Deluxe Auto:
+#   internet -> Nginx (80: сайт/API, 5000: registry)
+#   Frontend (статика) отдаёт Nginx
+#   Backend не публикует порты; к API можно попасть только через Nginx
+#   Postgres только во внутренней сети data, без проброса на хост
+#
+# Сети:
+#   edge         — единственный выход в интернет (Nginx)
+#   registry_net — внутренний, Nginx <-> Registry
+#   app          — внутренний, Nginx <-> Backend / pgAdmin
+#   data         — внутренний, Backend/pgAdmin <-> Postgres
+#
+# Пароли в .env с символом $ держите в одинарных кавычках:
+#   POSTGRES_PASSWORD='secret$'
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "2m"
+    max-file: "2"
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: deluxe_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "5000:5000"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    networks:
+      - edge
+      - app
+      - registry_net
+    depends_on:
+      registry:
+        condition: service_started
+      pgadmin:
+        condition: service_healthy
+    # После reboot Docker поднимает контейнеры параллельно, depends_on не действует.
+    # Ждём pgAdmin, чтобы /pgadmin/ не отдавал 502 в первые минуты.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        i=0
+        while [ $$i -lt 60 ]; do
+          wget -qO- http://pgadmin:8080/misc/ping >/dev/null 2>&1 && break
+          i=$$((i+1))
+          sleep 2
+        done
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: deluxe_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data
+    shm_size: 128mb
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    command:
+      - postgres
+      - -c
+      - max_wal_size=64MB
+      - -c
+      - min_wal_size=32MB
+      - -c
+      - logging_collector=off
+
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: deluxe_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_DISABLE_POSTFIX: "true"
+      PGADMIN_LISTEN_ADDRESS: "0.0.0.0"
+      PGADMIN_LISTEN_PORT: "8080"
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+      PGADMIN_CONFIG_PREFERRED_URL_SCHEME: "'http'"
+      PGADMIN_CONFIG_UPGRADE_CHECK_ENABLED: "False"
+      PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: "30"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - data
+      - app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/misc/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  registry:
+    image: registry:2.8
+    container_name: deluxe_registry
+    restart: unless-stopped
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Deluxe Auto Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_HTTP_SECRET: ${REGISTRY_PASSWORD}
+    volumes:
+      - registry_data:/var/lib/registry
+      - ./registry/auth/htpasswd:/auth/htpasswd:ro
+    networks:
+      - registry_net
+    # Порт 5000 наружу отдаёт Nginx, сам registry с хоста не слушает.
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  watchtower:
+    image: nickfedor/watchtower:1.12.3
+    container_name: deluxe_watchtower
+    restart: unless-stopped
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./registry/docker-config.json:/config.json:ro
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "86400"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_TIMEOUT: "30s"
+      DOCKER_API_VERSION: "1.44"
+    logging: *default-logging
+
+  # backend:
+  #   image: 127.0.0.1:5000/deluxe-auto/backend:latest
+  #   container_name: deluxe_backend
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   environment:
+  #     # Если в пароле есть $, в URL его нужно писать как %24
+  #     DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  #   networks:
+  #     - app
+  #     - data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   expose:
+  #     - "8000"
+  #   labels:
+  #     com.centurylinklabs.watchtower.enable: "true"
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   logging: *default-logging
+
+networks:
+  edge:
+    driver: bridge
+  registry_net:
+    driver: bridge
+    internal: true
+  app:
+    driver: bridge
+    internal: true
+  data:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  registry_data:

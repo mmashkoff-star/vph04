@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Deluxe Auto (internal Postgres)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "deluxe_auto",
+      "Username": "deluxe",
+      "SSLMode": "prefer",
+      "ConnectNow": false
+    }
+  }
+}

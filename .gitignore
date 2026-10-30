@@ -1,0 +1,6 @@
+.env
+registry/auth/htpasswd
+registry/docker-config.json
+nginx/certs/
+*.key
+*.crt
